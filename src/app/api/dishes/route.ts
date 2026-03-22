@@ -1,7 +1,7 @@
 import { asc, eq, inArray } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { getDb } from "@/db";
-import { dishIngredients, dishes, ingredients } from "@/db/schema";
+import { dishIngredients, dishPhotoLinks, dishes, ingredients } from "@/db/schema";
 
 export const runtime = "nodejs";
 
@@ -35,10 +35,45 @@ async function attachIngredients(
     byDish.set(l.dishId, list);
   }
 
+  const photoRows = await db
+    .select({
+      dishId: dishPhotoLinks.dishId,
+      sourceMessageId: dishPhotoLinks.sourceMessageId,
+      imageUrl: dishPhotoLinks.imageUrl,
+      caption: dishPhotoLinks.caption,
+      matchedTitle: dishPhotoLinks.matchedTitle,
+      confidence: dishPhotoLinks.confidence,
+    })
+    .from(dishPhotoLinks)
+    .where(inArray(dishPhotoLinks.dishId, ids));
+
+  const photosByDish = new Map<
+    number,
+    {
+      sourceMessageId: string;
+      imageUrl: string;
+      caption: string;
+      matchedTitle: string | null;
+      confidence: number | null;
+    }[]
+  >();
+  for (const p of photoRows) {
+    const list = photosByDish.get(p.dishId) ?? [];
+    list.push({
+      sourceMessageId: p.sourceMessageId,
+      imageUrl: p.imageUrl,
+      caption: p.caption,
+      matchedTitle: p.matchedTitle,
+      confidence: p.confidence,
+    });
+    photosByDish.set(p.dishId, list);
+  }
+
   return rows.map((r) => ({
     ...r,
     imageUrls: JSON.parse(r.imageUrlsJson || "[]") as string[],
     ingredients: byDish.get(r.id) ?? [],
+    dishPhotos: photosByDish.get(r.id) ?? [],
   }));
 }
 

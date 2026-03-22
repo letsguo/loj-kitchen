@@ -10,6 +10,13 @@ type Dish = {
   sourceMessageId: string;
   imageUrls: string[];
   ingredients: string[];
+  dishPhotos: {
+    sourceMessageId: string;
+    imageUrl: string;
+    caption: string;
+    matchedTitle: string | null;
+    confidence: number | null;
+  }[];
 };
 
 export default function Home() {
@@ -96,7 +103,7 @@ export default function Home() {
           LOJ Kitchen
         </h1>
         <p className="mt-1 text-sm text-stone-500">
-          Dishes from GroupMe — filter by ingredients you have.
+          Dishes from GroupMe menus, linked to meal photos.
         </p>
       </header>
 
@@ -109,7 +116,8 @@ export default function Home() {
             First run <strong>Backfill</strong> once, then use{" "}
             <strong>Incremental</strong> (or cron) for new messages. Requires{" "}
             <code className="rounded bg-stone-100 px-1">.env</code> GroupMe vars;
-            Vision needs <code className="rounded bg-stone-100 px-1">GOOGLE_APPLICATION_CREDENTIALS</code>.
+            Vision needs{" "}
+            <code className="rounded bg-stone-100 px-1">OPENAI_API_KEY</code>.
           </p>
           <div className="mt-4 flex flex-wrap gap-2">
             <button
@@ -251,13 +259,41 @@ export default function Home() {
                     ))}
                   </div>
                 ) : null}
+                {d.dishPhotos.length > 0 ? (
+                  <div className="mt-3">
+                    <p className="text-xs font-medium text-stone-500">
+                      Matched meal photos ({d.dishPhotos.length})
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {d.dishPhotos.map((p) => (
+                        <a
+                          key={`${p.sourceMessageId}-${p.imageUrl}`}
+                          href={p.imageUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="rounded border border-stone-300 px-2 py-1 text-xs text-stone-700 hover:bg-stone-50"
+                          title={
+                            p.caption
+                              ? `${p.caption}${p.confidence !== null ? ` (confidence ${p.confidence})` : ""}`
+                              : p.confidence !== null
+                                ? `confidence ${p.confidence}`
+                                : "Linked meal photo"
+                          }
+                        >
+                          Meal photo
+                          {p.confidence !== null ? ` (${p.confidence})` : ""}
+                        </a>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
               </li>
             ))}
           </ul>
           {!loading && dishes.length === 0 ? (
             <p className="mt-6 text-center text-sm text-stone-500">
-              No dishes yet. Run a sync with GroupMe + Vision configured, or
-              loosen ingredient filters.
+              No dishes yet. Run a sync with GroupMe + OpenAI vision configured,
+              or loosen ingredient filters.
             </p>
           ) : null}
         </section>
