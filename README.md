@@ -1,36 +1,93 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# LOJ Kitchen
 
-## Getting Started
+Import a GroupMe group’s food content, OCR menu images with **Google Cloud Vision**, parse lines into dishes and ingredients, and filter dishes by what you have on hand.
 
-First, run the development server:
+**Database:** **PostgreSQL** (e.g. [Neon](https://neon.tech/) or [Supabase](https://supabase.com/) free tier).  
+**Deploy:** [Vercel](https://vercel.com/) — see [Deploy on Vercel](#deploy-on-vercel).
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+## Local setup
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+1. **Postgres URL** — create a free Neon (or Supabase) project and copy the **pooled** connection string (`sslmode=require` is typical).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+2. **Env** — copy `.env.example` to `.env.local` and set at least:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+   - `DATABASE_URL` — `postgresql://...`
+   - `GROUPME_TOKEN`, `GROUPME_GROUP_ID`
+   - Vision (one of):
+     - `GOOGLE_SERVICE_ACCOUNT_JSON` — entire service account JSON as a **single-line** string (good for Vercel secrets), **or**
+     - `GOOGLE_APPLICATION_CREDENTIALS` — absolute path to the JSON file on your machine
+   - Optional: `SKIP_VISION=1` to skip OCR
 
-## Learn More
+3. **Schema** — with `DATABASE_URL` set:
 
-To learn more about Next.js, take a look at the following resources:
+   ```bash
+   npm run db:push
+   ```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+4. **GroupMe** — find your group id:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+   ```bash
+   npm run dev
+   curl -s "http://localhost:3000/api/groups"
+   ```
+
+5. **Run**
+
+   ```bash
+   npm run dev
+   ```
+
+   Open [http://localhost:3000](http://localhost:3000). Use **Backfill history** once, then **Incremental**.
+
+### Parsing behavior
+
+- **Image-only** dish extraction: text-only chat messages are not parsed into dishes.
+- OCR text must pass **strict “weekly menu”** heuristics or the image is skipped.
+
+### Quick backfill cap
+
+Set `BACKFILL_MAX_MESSAGES=20` in `.env.local` to ingest only the 20 newest messages while testing. Remove for full history. While set, `backfillComplete` stays `false` until an uncapped backfill.
 
 ## Deploy on Vercel
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+1. Push the repo to GitHub and **Import** the project in Vercel.
+2. **Environment variables** (Vercel → Project → Settings → Environment Variables):
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+   | Variable | Notes |
+   |----------|--------|
+   | `DATABASE_URL` | Neon pooled Postgres URL |
+   | `GROUPME_TOKEN`, `GROUPME_GROUP_ID` | From GroupMe dev portal |
+   | `GOOGLE_SERVICE_ACCOUNT_JSON` | Full JSON as one secret (recommended) |
+   | `SYNC_SECRET` | Protects `POST /api/sync` if you call it manually |
+   | `CRON_SECRET` | Vercel sends `Authorization: Bearer <CRON_SECRET>` to cron routes; if omitted, `SYNC_SECRET` is used |
+
+3. **First deploy** — from your machine (or CI), with production `DATABASE_URL`:
+
+   ```bash
+   DATABASE_URL="postgresql://..." npm run db:push
+   ```
+
+4. **Cron** — [`vercel.json`](vercel.json) schedules `GET /api/cron/sync` every 6 hours (incremental sync). Cron availability depends on your Vercel plan; adjust the schedule or disable `vercel.json` if needed.
+
+5. Set **`CRON_SECRET`** in Vercel so the cron request is authenticated (see [Vercel Cron security](https://vercel.com/docs/cron-jobs#securing-cron-jobs)).
+
+## API
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/groups` | List group ids/names (needs `GROUPME_TOKEN`) |
+| `GET /api/dishes?ingredient=x&ingredient=y&match=all\|any` | Filter dishes |
+| `GET /api/ingredients` | Ingredient names for autocomplete |
+| `POST /api/sync` | Body `{ "mode": "incremental" \| "backfill" \| "full" }`. Optional `SYNC_SECRET` via `x-sync-secret` or body `secret`. |
+| `GET /api/cron/sync` | **Vercel Cron** — incremental sync; `Authorization: Bearer <CRON_SECRET>`. |
+
+The home page uses a **server action** for sync (no secret in the browser for manual clicks).
+
+## Customizing ingredients
+
+Edit [`data/ingredient-aliases.json`](data/ingredient-aliases.json): keys are canonical names, values are aliases mapped to that ingredient during parsing.
+
+## Notes
+
+- `drizzle.config.ts` requires `DATABASE_URL` when running `npm run db:push` / `db:studio`.
+- `pg` pool uses `max: 1` to reduce connection churn on serverless; Neon pooled URLs are a good fit.

@@ -1,64 +1,266 @@
-import Image from "next/image";
+"use client";
+
+import { kitchenSync } from "@/app/actions/sync";
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+type Dish = {
+  id: number;
+  title: string;
+  rawLine: string;
+  sourceMessageId: string;
+  imageUrls: string[];
+  ingredients: string[];
+};
 
 export default function Home() {
+  const [dishes, setDishes] = useState<Dish[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMsg, setSyncMsg] = useState<string | null>(null);
+  const [ingredientOptions, setIngredientOptions] = useState<string[]>([]);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [input, setInput] = useState("");
+  const [match, setMatch] = useState<"all" | "any">("all");
+  const [warning, setWarning] = useState<string | null>(null);
+
+  const loadDishes = useCallback(async () => {
+    setLoading(true);
+    setWarning(null);
+    try {
+      const params = new URLSearchParams();
+      for (const i of selected) {
+        params.append("ingredient", i);
+      }
+      params.set("match", match);
+      const res = await fetch(`/api/dishes?${params}`);
+      const data = await res.json();
+      setDishes(data.dishes ?? []);
+      setWarning(data.warning ?? null);
+    } finally {
+      setLoading(false);
+    }
+  }, [selected, match]);
+
+  useEffect(() => {
+    void loadDishes();
+  }, [loadDishes]);
+
+  useEffect(() => {
+    void fetch("/api/ingredients")
+      .then((r) => r.json())
+      .then((d) => setIngredientOptions(d.ingredients ?? []))
+      .catch(() => setIngredientOptions([]));
+  }, [dishes]);
+
+  const suggestions = useMemo(() => {
+    const q = input.toLowerCase().trim();
+    if (!q) return [];
+    return ingredientOptions
+      .filter((n) => n.includes(q) && !selected.includes(n))
+      .slice(0, 12);
+  }, [input, ingredientOptions, selected]);
+
+  async function runSync(mode: "incremental" | "backfill" | "full") {
+    setSyncing(true);
+    setSyncMsg(null);
+    try {
+      const data = await kitchenSync(mode);
+      if (!data.ok) {
+        setSyncMsg(data.error);
+        return;
+      }
+      setSyncMsg(JSON.stringify(data.result, null, 2));
+      await loadDishes();
+      const ing = await fetch("/api/ingredients").then((r) => r.json());
+      setIngredientOptions(ing.ingredients ?? []);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  function addIngredient(name: string) {
+    const n = name.toLowerCase().trim();
+    if (!n || selected.includes(n)) return;
+    setSelected((s) => [...s, n]);
+    setInput("");
+  }
+
+  function removeIngredient(name: string) {
+    setSelected((s) => s.filter((x) => x !== name));
+  }
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+    <div className="min-h-screen bg-stone-50 text-stone-900">
+      <header className="border-b border-stone-200 bg-white px-6 py-5">
+        <h1 className="text-xl font-semibold tracking-tight text-stone-800">
+          LOJ Kitchen
+        </h1>
+        <p className="mt-1 text-sm text-stone-500">
+          Dishes from GroupMe — filter by ingredients you have.
+        </p>
+      </header>
+
+      <main className="mx-auto max-w-3xl px-6 py-8">
+        <section className="rounded-xl border border-stone-200 bg-white p-5 shadow-sm">
+          <h2 className="text-sm font-medium uppercase tracking-wide text-stone-500">
+            Sync
+          </h2>
+          <p className="mt-2 text-sm text-stone-600">
+            First run <strong>Backfill</strong> once, then use{" "}
+            <strong>Incremental</strong> (or cron) for new messages. Requires{" "}
+            <code className="rounded bg-stone-100 px-1">.env</code> GroupMe vars;
+            Vision needs <code className="rounded bg-stone-100 px-1">GOOGLE_APPLICATION_CREDENTIALS</code>.
           </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={syncing}
+              onClick={() => void runSync("backfill")}
+              className="rounded-lg bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50"
+            >
+              Backfill history
+            </button>
+            <button
+              type="button"
+              disabled={syncing}
+              onClick={() => void runSync("incremental")}
+              className="rounded-lg bg-stone-800 px-4 py-2 text-sm font-medium text-white hover:bg-stone-900 disabled:opacity-50"
+            >
+              Incremental
+            </button>
+            <button
+              type="button"
+              disabled={syncing}
+              onClick={() => void runSync("full")}
+              className="rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-800 hover:bg-stone-50 disabled:opacity-50"
+            >
+              Full (backfill + incremental)
+            </button>
+          </div>
+          {syncMsg ? (
+            <pre className="mt-4 max-h-40 overflow-auto rounded-lg bg-stone-900 p-3 text-xs text-stone-100">
+              {syncMsg}
+            </pre>
+          ) : null}
+        </section>
+
+        <section className="mt-8 rounded-xl border border-stone-200 bg-white p-5 shadow-sm">
+          <h2 className="text-sm font-medium uppercase tracking-wide text-stone-500">
+            Ingredients I have
+          </h2>
+          <div className="relative mt-3">
+            <input
+              type="text"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  if (suggestions[0]) addIngredient(suggestions[0]);
+                  else if (input.trim()) addIngredient(input);
+                }
+              }}
+              placeholder="Type e.g. chicken thigh, rice…"
+              className="w-full rounded-lg border border-stone-300 px-3 py-2 text-sm outline-none ring-amber-500 focus:border-amber-500 focus:ring-1"
             />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
+            {suggestions.length > 0 ? (
+              <ul className="absolute z-10 mt-1 max-h-48 w-full overflow-auto rounded-lg border border-stone-200 bg-white py-1 shadow-lg">
+                {suggestions.map((s) => (
+                  <li key={s}>
+                    <button
+                      type="button"
+                      className="w-full px-3 py-2 text-left text-sm hover:bg-stone-100"
+                      onClick={() => addIngredient(s)}
+                    >
+                      {s}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {selected.map((s) => (
+              <button
+                key={s}
+                type="button"
+                onClick={() => removeIngredient(s)}
+                className="group flex items-center gap-1 rounded-full bg-amber-100 px-3 py-1 text-sm text-amber-950 hover:bg-amber-200"
+              >
+                {s}
+                <span className="text-amber-700 group-hover:text-amber-900">
+                  ×
+                </span>
+              </button>
+            ))}
+          </div>
+          <div className="mt-4 flex flex-wrap items-center gap-4 text-sm">
+            <label className="flex items-center gap-2 text-stone-700">
+              <input
+                type="radio"
+                name="match"
+                checked={match === "all"}
+                onChange={() => setMatch("all")}
+              />
+              Match all selected
+            </label>
+            <label className="flex items-center gap-2 text-stone-700">
+              <input
+                type="radio"
+                name="match"
+                checked={match === "any"}
+                onChange={() => setMatch("any")}
+              />
+              Match any
+            </label>
+          </div>
+          {warning ? (
+            <p className="mt-3 text-sm text-amber-800">{warning}</p>
+          ) : null}
+        </section>
+
+        <section className="mt-8">
+          <h2 className="text-sm font-medium uppercase tracking-wide text-stone-500">
+            Dishes {loading ? "(loading…)" : `(${dishes.length})`}
+          </h2>
+          <ul className="mt-4 space-y-4">
+            {dishes.map((d) => (
+              <li
+                key={d.id}
+                className="rounded-xl border border-stone-200 bg-white p-4 shadow-sm"
+              >
+                <h3 className="font-medium text-stone-900">{d.title}</h3>
+                <p className="mt-1 text-sm text-stone-600">{d.rawLine}</p>
+                {d.ingredients.length > 0 ? (
+                  <p className="mt-2 text-xs text-stone-500">
+                    {d.ingredients.join(" · ")}
+                  </p>
+                ) : null}
+                {d.imageUrls.length > 0 ? (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {d.imageUrls.map((url) => (
+                      <a
+                        key={url}
+                        href={url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs font-medium text-amber-700 underline hover:text-amber-900"
+                      >
+                        Menu image
+                      </a>
+                    ))}
+                  </div>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+          {!loading && dishes.length === 0 ? (
+            <p className="mt-6 text-center text-sm text-stone-500">
+              No dishes yet. Run a sync with GroupMe + Vision configured, or
+              loosen ingredient filters.
+            </p>
+          ) : null}
+        </section>
       </main>
     </div>
   );

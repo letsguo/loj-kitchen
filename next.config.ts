@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  serverExternalPackages: ["pg", "@google-cloud/vision", "google-gax"],
 };
 
 export default nextConfig;
