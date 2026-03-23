@@ -26,6 +26,8 @@ export const messagesRaw = pgTable("messages_raw", {
   ocrText: text("ocr_text"),
   ocrProvider: text("ocr_provider"),
   ocrAt: timestamp("ocr_at", { mode: "date", withTimezone: true }),
+  visionKind: text("vision_kind"),
+  visionJson: text("vision_json"),
   userId: text("user_id"),
   userName: text("user_name"),
 });
@@ -38,6 +40,27 @@ export const dishes = pgTable("dishes", {
   sortIndex: integer("sort_index").notNull().default(0),
   imageUrlsJson: text("image_urls_json").notNull().default("[]"),
 });
+
+export const dishPhotoLinks = pgTable(
+  "dish_photo_links",
+  {
+    dishId: integer("dish_id")
+      .notNull()
+      .references(() => dishes.id, { onDelete: "cascade" }),
+    sourceMessageId: text("source_message_id")
+      .notNull()
+      .references(() => messagesRaw.id, { onDelete: "cascade" }),
+    imageUrl: text("image_url").notNull(),
+    caption: text("caption").notNull().default(""),
+    matchedTitle: text("matched_title"),
+    confidence: integer("confidence"),
+    matchedAt: timestamp("matched_at", { mode: "date", withTimezone: true })
+      .notNull(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.dishId, t.sourceMessageId, t.imageUrl] }),
+  }),
+);
 
 export const ingredients = pgTable("ingredients", {
   id: serial("id").primaryKey(),

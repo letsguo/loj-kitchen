@@ -1,6 +1,6 @@
 # LOJ Kitchen
 
-Import a GroupMe group’s food content, OCR menu images with **Google Cloud Vision**, parse lines into dishes and ingredients, and filter dishes by what you have on hand.
+Import a GroupMe group’s food content, analyze menu images with **OpenAI vision**, parse menu lines into dishes and ingredients, and link meal photos back to likely menu items using the accompanying message text.
 
 **Database:** **PostgreSQL** (e.g. [Neon](https://neon.tech/) or [Supabase](https://supabase.com/) free tier).  
 **Deploy:** [Vercel](https://vercel.com/) — see [Deploy on Vercel](#deploy-on-vercel).
@@ -13,10 +13,9 @@ Import a GroupMe group’s food content, OCR menu images with **Google Cloud Vis
 
    - `DATABASE_URL` — `postgresql://...`
    - `GROUPME_TOKEN`, `GROUPME_GROUP_ID`
-   - Vision (one of):
-     - `GOOGLE_SERVICE_ACCOUNT_JSON` — entire service account JSON as a **single-line** string (good for Vercel secrets), **or**
-     - `GOOGLE_APPLICATION_CREDENTIALS` — absolute path to the JSON file on your machine
-   - Optional: `SKIP_VISION=1` to skip OCR
+   - `OPENAI_API_KEY` — your OpenAI API key
+   - Optional: `OPENAI_VISION_MODEL` — defaults to `gpt-4o-mini` (low-cost model)
+   - Optional: `SKIP_VISION=1` to skip image analysis
 
 3. **Schema** — with `DATABASE_URL` set:
 
@@ -42,7 +41,8 @@ Import a GroupMe group’s food content, OCR menu images with **Google Cloud Vis
 ### Parsing behavior
 
 - **Image-only** dish extraction: text-only chat messages are not parsed into dishes.
-- OCR text must pass **strict “weekly menu”** heuristics or the image is skipped.
+- Menu images are parsed into dish lines.
+- Meal photos are linked using their accompanying message text (caption/description), not by meal-image inference.
 
 ### Quick backfill cap
 
@@ -57,7 +57,8 @@ Set `BACKFILL_MAX_MESSAGES=20` in `.env.local` to ingest only the 20 newest mess
    |----------|--------|
    | `DATABASE_URL` | Neon pooled Postgres URL |
    | `GROUPME_TOKEN`, `GROUPME_GROUP_ID` | From GroupMe dev portal |
-   | `GOOGLE_SERVICE_ACCOUNT_JSON` | Full JSON as one secret (recommended) |
+   | `OPENAI_API_KEY` | OpenAI API key for menu/meal image analysis |
+   | `OPENAI_VISION_MODEL` | Optional. Defaults to `gpt-4o-mini` |
    | `SYNC_SECRET` | Protects `POST /api/sync` if you call it manually |
    | `CRON_SECRET` | Vercel sends `Authorization: Bearer <CRON_SECRET>` to cron routes; if omitted, `SYNC_SECRET` is used |
 
@@ -91,3 +92,4 @@ Edit [`data/ingredient-aliases.json`](data/ingredient-aliases.json): keys are ca
 
 - `drizzle.config.ts` requires `DATABASE_URL` when running `npm run db:push` / `db:studio`.
 - `pg` pool uses `max: 1` to reduce connection churn on serverless; Neon pooled URLs are a good fit.
+- OpenAI image analysis runs in Node runtime route handlers/server actions and deploys cleanly to Vercel.

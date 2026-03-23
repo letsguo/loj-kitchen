@@ -1,6 +1,7 @@
-import { eq, max } from "drizzle-orm";
+import { desc, eq, max } from "drizzle-orm";
 import { getDb } from "@/db";
 import {
+  dishPhotoLinks,
   dishIngredients,
   dishes,
   ingredients,
@@ -13,15 +14,20 @@ import {
   type GroupMeMessage,
 } from "@/lib/groupme";
 import {
-  classifyOcrMenuStrict,
   dishTitleFromLine,
+  classifyOcrMenuStrict,
   normalizeIngredientToken,
   splitIntoDishLines,
   tokenizeIngredientsFromLine,
 } from "@/lib/parser";
-import { fetchImageBytes, isVisionConfigured, ocrImageBuffer } from "@/lib/vision";
+import {
+  analyzeMessageImages,
+  isVisionConfigured,
+  type VisionImageAnalysis,
+  type VisionMessageAnalysis,
+} from "@/lib/vision";
 
-const OCR_PROVIDER = "gcp_vision_document";
+const OCR_PROVIDER = "openai_responses_vision";
 
 /** If set (e.g. `20`), backfill stops after that many messages (newest first). Omit for full history. */
 function readBackfillMax(): number | undefined {
@@ -44,46 +50,154 @@ function maxMessageId(a: string, b: string): string {
   }
 }
 
-/** New OCR text from this run only; `null` if skipped or failed. */
-async function runOcrIfNeeded(
+type ExistingMessageRow = {
+  ocrText: string | null;
+  ocrProvider: string | null;
+  visionKind: string | null;
+  visionJson: string | null;
+};
+
+type FreshVision = {
+  analysis: VisionMessageAnalysis | null;
+  ocrText: string | null;
+  ocrProvider: string | null;
+  ocrAt: Date | null;
+  visionKind: string | null;
+  visionJson: string | null;
+};
+
+function summarizeVisionKind(items: VisionImageAnalysis[]): string | null {
+  if (items.some((i) => i.kind === "menu")) return "menu";
+  if (items.some((i) => i.kind === "meal")) return "meal";
+  if (items.some((i) => i.kind === "other")) return "other";
+  if (items.some((i) => i.kind === "uncertain")) return "uncertain";
+  return null;
+}
+
+function collectMenuText(analysis: VisionMessageAnalysis): string | null {
+  const chunks = analysis.items
+    .filter((i) => i.kind === "menu")
+    .map((i) => i.menuText.trim())
+    .filter(Boolean);
+  return chunks.join("\n\n").trim() || null;
+}
+
+function looksLikeMenuCaption(caption: string): boolean {
+  const text = caption.toLowerCase().trim();
+  if (!text) return false;
+  if (
+    /(menu|weekly|this week|cafeteria|lunch|dinner|breakfast|monday|tuesday|wednesday|thursday|friday|saturday|sunday)/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  return lines.length >= 4;
+}
+
+async function listRecentDishTitles(limit: number): Promise<string[]> {
+  const db = getDb();
+  const rows = await db
+    .select({ title: dishes.title })
+    .from(dishes)
+    .orderBy(desc(dishes.id))
+    .limit(limit);
+  const unique = new Set<string>();
+  for (const row of rows) {
+    const t = row.title.trim();
+    if (t) unique.add(t);
+  }
+  return [...unique];
+}
+
+/** New OpenAI vision analysis from this run only; `null` if skipped or failed. */
+async function runVisionIfNeeded(
   msg: GroupMeMessage,
-  existingOcr: string | null,
-): Promise<{ ocrText: string | null; ocrProvider: string | null; ocrAt: Date | null }> {
-  if (existingOcr?.trim()) {
-    return { ocrText: null, ocrProvider: null, ocrAt: null };
+  existing: ExistingMessageRow,
+): Promise<FreshVision> {
+  if (existing.visionJson?.trim()) {
+    return {
+      analysis: null,
+      ocrText: null,
+      ocrProvider: null,
+      ocrAt: null,
+      visionKind: null,
+      visionJson: null,
+    };
   }
   const urls = messageImageUrls(msg);
   if (urls.length === 0) {
-    return { ocrText: null, ocrProvider: null, ocrAt: null };
+    return {
+      analysis: null,
+      ocrText: null,
+      ocrProvider: null,
+      ocrAt: null,
+      visionKind: null,
+      visionJson: null,
+    };
   }
   if (!isVisionConfigured() || process.env.SKIP_VISION === "1") {
-    return { ocrText: null, ocrProvider: null, ocrAt: null };
+    return {
+      analysis: null,
+      ocrText: null,
+      ocrProvider: null,
+      ocrAt: null,
+      visionKind: null,
+      visionJson: null,
+    };
   }
-  const chunks: string[] = [];
-  for (const url of urls) {
-    try {
-      const buf = await fetchImageBytes(url);
-      const text = await ocrImageBuffer(buf);
-      if (text) chunks.push(text);
-    } catch (e) {
-      console.error("OCR failed for", url, e);
-    }
+  // Meal images are matched via message text; only call OpenAI for likely menu posts.
+  if (!looksLikeMenuCaption(msg.text ?? "")) {
+    return {
+      analysis: null,
+      ocrText: null,
+      ocrProvider: null,
+      ocrAt: null,
+      visionKind: null,
+      visionJson: null,
+    };
   }
-  const merged = chunks.join("\n\n").trim() || null;
+  const knownTitles = await listRecentDishTitles(120);
+  const analysis = await analyzeMessageImages(urls, msg.text ?? "", knownTitles);
+  if (!analysis) {
+    return {
+      analysis: null,
+      ocrText: null,
+      ocrProvider: null,
+      ocrAt: null,
+      visionKind: null,
+      visionJson: null,
+    };
+  }
+  const mergedMenuText = collectMenuText(analysis);
+  const now = new Date();
   return {
-    ocrText: merged,
-    ocrProvider: merged ? OCR_PROVIDER : null,
-    ocrAt: merged ? new Date() : null,
+    analysis,
+    ocrText: mergedMenuText,
+    ocrProvider: OCR_PROVIDER,
+    ocrAt: now,
+    visionKind: summarizeVisionKind(analysis.items),
+    visionJson: JSON.stringify(analysis),
   };
 }
 
 async function upsertMessageRow(
   msg: GroupMeMessage,
-  existingOcr: string | null,
-  fresh: { ocrText: string | null; ocrProvider: string | null; ocrAt: Date | null },
+  existing: ExistingMessageRow,
+  fresh: FreshVision,
 ) {
   const db = getDb();
-  const finalOcr = fresh.ocrText ?? existingOcr ?? null;
+  const finalOcr = fresh.ocrText ?? existing.ocrText ?? null;
+  const finalVisionKind = fresh.visionKind ?? existing.visionKind ?? null;
+  const finalVisionJson = fresh.visionJson ?? existing.visionJson ?? null;
+  const finalProvider = finalOcr
+    ? (fresh.ocrProvider ?? existing.ocrProvider ?? OCR_PROVIDER)
+    : null;
+  const finalOcrAt = finalOcr ? (fresh.ocrAt ?? new Date()) : null;
 
   await db
     .insert(messagesRaw)
@@ -94,8 +208,10 @@ async function upsertMessageRow(
       text: msg.text ?? "",
       attachmentsJson: JSON.stringify(msg.attachments ?? []),
       ocrText: finalOcr,
-      ocrProvider: finalOcr ? (fresh.ocrProvider ?? OCR_PROVIDER) : null,
-      ocrAt: finalOcr ? (fresh.ocrAt ?? new Date()) : null,
+      ocrProvider: finalProvider,
+      ocrAt: finalOcrAt,
+      visionKind: finalVisionKind,
+      visionJson: finalVisionJson,
       userId: msg.user_id,
       userName: msg.name,
     })
@@ -106,96 +222,303 @@ async function upsertMessageRow(
             text: msg.text ?? "",
             attachmentsJson: JSON.stringify(msg.attachments ?? []),
             userName: msg.name,
-            ocrText: fresh.ocrText,
-            ocrProvider: fresh.ocrProvider ?? OCR_PROVIDER,
-            ocrAt: fresh.ocrAt ?? new Date(),
+            ocrText: finalOcr,
+            ocrProvider: finalProvider,
+            ocrAt: finalOcrAt,
+            visionKind: finalVisionKind,
+            visionJson: finalVisionJson,
           }
         : {
             text: msg.text ?? "",
             attachmentsJson: JSON.stringify(msg.attachments ?? []),
             userName: msg.name,
+            ocrText: finalOcr,
+            ocrProvider: finalProvider,
+            ocrAt: finalOcrAt,
+            visionKind: finalVisionKind,
+            visionJson: finalVisionJson,
           },
     });
 }
 
+function parseVisionJson(raw: string | null): VisionMessageAnalysis | null {
+  if (!raw?.trim()) return null;
+  try {
+    const parsed = JSON.parse(raw) as VisionMessageAnalysis;
+    if (!parsed || !Array.isArray(parsed.items)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeTitle(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenSet(text: string): Set<string> {
+  const parts = normalizeTitle(text)
+    .split(" ")
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 3);
+  return new Set(parts);
+}
+
+function overlapScore(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let overlap = 0;
+  for (const t of a) {
+    if (b.has(t)) overlap++;
+  }
+  return overlap / Math.max(a.size, b.size);
+}
+
+type CandidateDish = {
+  id: number;
+  title: string;
+  norm: string;
+  tokens: Set<string>;
+};
+
+async function loadCandidateDishes(limit = 220): Promise<CandidateDish[]> {
+  const db = getDb();
+  const rows = await db
+    .select({ id: dishes.id, title: dishes.title })
+    .from(dishes)
+    .orderBy(desc(dishes.id))
+    .limit(limit);
+  return rows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    norm: normalizeTitle(r.title),
+    tokens: tokenSet(r.title),
+  }));
+}
+
+function chooseDishForCaption(
+  caption: string,
+  candidates: CandidateDish[],
+): { dish: CandidateDish; confidence: number } | null {
+  const normalizedCaption = normalizeTitle(caption);
+  if (!normalizedCaption) return null;
+
+  const byNorm = new Map<string, CandidateDish>();
+  for (const c of candidates) {
+    if (!byNorm.has(c.norm)) byNorm.set(c.norm, c);
+  }
+
+  const exact = byNorm.get(normalizedCaption);
+  if (exact) {
+    return { dish: exact, confidence: 95 };
+  }
+
+  let bestContains: CandidateDish | null = null;
+  for (const c of candidates) {
+    if (c.norm.length >= 6 && normalizedCaption.includes(c.norm)) {
+      if (!bestContains || c.norm.length > bestContains.norm.length) {
+        bestContains = c;
+      }
+    }
+  }
+  if (bestContains) {
+    return { dish: bestContains, confidence: 90 };
+  }
+
+  const probe = tokenSet(caption);
+  if (probe.size === 0) return null;
+
+  let best: CandidateDish | null = null;
+  let bestScore = 0;
+  for (const c of candidates) {
+    const score = overlapScore(probe, c.tokens);
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+  const threshold = probe.size <= 2 ? 0.8 : 0.6;
+  if (best && bestScore >= threshold) {
+    const confidence = Math.max(55, Math.min(89, Math.round(bestScore * 100)));
+    return { dish: best, confidence };
+  }
+  return null;
+}
+
+function extractMenuLinesFromVision(
+  vision: VisionMessageAnalysis,
+): { lines: string[]; menuImageUrls: string[] } {
+  const menuItems: string[] = [];
+  const menuImageUrls: string[] = [];
+  const menuTexts: string[] = [];
+  for (const item of vision.items) {
+    if (item.kind !== "menu") continue;
+    menuImageUrls.push(item.imageUrl);
+    for (const line of item.menuItems) {
+      const trimmed = line.trim();
+      if (trimmed) menuItems.push(trimmed);
+    }
+    if (item.menuText.trim()) menuTexts.push(item.menuText.trim());
+  }
+
+  let lines = [...new Set(menuItems)];
+  if (lines.length === 0 && menuTexts.length > 0) {
+    lines = splitIntoDishLines(menuTexts.join("\n\n"));
+  }
+  return { lines, menuImageUrls: [...new Set(menuImageUrls)] };
+}
+
+async function upsertDishPhotoLinksFromCaption(msg: GroupMeMessage) {
+  const db = getDb();
+  const imageUrls = messageImageUrls(msg);
+  if (imageUrls.length === 0) return;
+
+  const caption = (msg.text ?? "").trim();
+  if (!caption || looksLikeMenuCaption(caption)) return;
+
+  const candidates = await loadCandidateDishes();
+  if (candidates.length === 0) return;
+
+  const selected = chooseDishForCaption(caption, candidates);
+  if (!selected) return;
+
+  for (const imageUrl of imageUrls) {
+    await db
+      .insert(dishPhotoLinks)
+      .values({
+        dishId: selected.dish.id,
+        sourceMessageId: msg.id,
+        imageUrl,
+        caption,
+        matchedTitle: selected.dish.title,
+        confidence: selected.confidence,
+        matchedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [
+          dishPhotoLinks.dishId,
+          dishPhotoLinks.sourceMessageId,
+          dishPhotoLinks.imageUrl,
+        ],
+        set: {
+          caption,
+          matchedTitle: selected.dish.title,
+          confidence: selected.confidence,
+          matchedAt: new Date(),
+        },
+      });
+  }
+}
+
 async function reparseDishesForMessage(
   msg: GroupMeMessage,
-  ocrText: string | null,
+  vision: VisionMessageAnalysis | null,
+  fallbackOcrText: string | null,
 ) {
   const db = getDb();
   const imageUrls = messageImageUrls(msg);
-  // Image-only dish extraction: skip all text-only messages.
+  // Image-only extraction: skip all text-only messages.
   if (imageUrls.length === 0) {
     await db.delete(dishes).where(eq(dishes.sourceMessageId, msg.id));
+    await db.delete(dishPhotoLinks).where(eq(dishPhotoLinks.sourceMessageId, msg.id));
     return;
   }
 
-  // Strict mode: only parse OCR that strongly looks like a menu.
-  const menu = classifyOcrMenuStrict(ocrText);
-  if (!menu.isMenu) {
-    await db.delete(dishes).where(eq(dishes.sourceMessageId, msg.id));
+  if (!vision && !(fallbackOcrText ?? "").trim()) {
+    // No menu analysis available yet; keep any existing parse results intact.
+    await db.delete(dishPhotoLinks).where(eq(dishPhotoLinks.sourceMessageId, msg.id));
+    await upsertDishPhotoLinksFromCaption(msg);
     return;
   }
 
-  // Parse dishes from OCR text only (ignore chat caption/body text).
-  const canon = (ocrText ?? "").trim();
-  if (!canon) return;
+  let lines: string[] = [];
+  let menuImageUrls = imageUrls;
+  let shouldRebuildMenuRows = false;
 
-  await db.delete(dishes).where(eq(dishes.sourceMessageId, msg.id));
-
-  const lines = splitIntoDishLines(canon);
-  let sortIndex = 0;
-  for (const line of lines) {
-    const title = dishTitleFromLine(line);
-    const tokens = tokenizeIngredientsFromLine(line);
-    const normalized = [
-      ...new Set(
-        tokens.map(normalizeIngredientToken).filter((t) => t.length >= 2),
-      ),
-    ];
-    if (normalized.length === 0 && title.length < 4) continue;
-
-    const [dishRow] = await db
-      .insert(dishes)
-      .values({
-        sourceMessageId: msg.id,
-        title,
-        rawLine: line,
-        sortIndex: sortIndex++,
-        imageUrlsJson: JSON.stringify(imageUrls),
-      })
-      .returning({ id: dishes.id });
-
-    if (!dishRow) continue;
-
-    for (const ingName of normalized) {
-      await db
-        .insert(ingredients)
-        .values({ name: ingName })
-        .onConflictDoNothing({ target: ingredients.name });
-      const [ing] = await db
-        .select({ id: ingredients.id })
-        .from(ingredients)
-        .where(eq(ingredients.name, ingName))
-        .limit(1);
-      if (!ing) continue;
-      await db
-        .insert(dishIngredients)
-        .values({ dishId: dishRow.id, ingredientId: ing.id })
-        .onConflictDoNothing();
+  if (vision) {
+    const extracted = extractMenuLinesFromVision(vision);
+    lines = extracted.lines;
+    menuImageUrls = extracted.menuImageUrls.length > 0 ? extracted.menuImageUrls : imageUrls;
+    shouldRebuildMenuRows = lines.length > 0;
+  } else {
+    const menu = classifyOcrMenuStrict(fallbackOcrText);
+    if (menu.isMenu) {
+      lines = splitIntoDishLines((fallbackOcrText ?? "").trim());
+      shouldRebuildMenuRows = lines.length > 0;
+    } else {
+      await db.delete(dishes).where(eq(dishes.sourceMessageId, msg.id));
+      return;
     }
   }
+
+  if (shouldRebuildMenuRows) {
+    await db.delete(dishes).where(eq(dishes.sourceMessageId, msg.id));
+  } else if (vision) {
+    // If we confidently analyzed the message but found no menu content, clear menu rows for this message.
+    await db.delete(dishes).where(eq(dishes.sourceMessageId, msg.id));
+  }
+
+  if (shouldRebuildMenuRows) {
+    let sortIndex = 0;
+    for (const line of lines) {
+      const title = dishTitleFromLine(line);
+      const tokens = tokenizeIngredientsFromLine(line);
+      const normalized = [
+        ...new Set(
+          tokens.map(normalizeIngredientToken).filter((t) => t.length >= 2),
+        ),
+      ];
+      if (normalized.length === 0 && title.length < 4) continue;
+
+      const [dishRow] = await db
+        .insert(dishes)
+        .values({
+          sourceMessageId: msg.id,
+          title,
+          rawLine: line,
+          sortIndex: sortIndex++,
+          imageUrlsJson: JSON.stringify(menuImageUrls),
+        })
+        .returning({ id: dishes.id });
+
+      if (!dishRow) continue;
+
+      for (const ingName of normalized) {
+        await db
+          .insert(ingredients)
+          .values({ name: ingName })
+          .onConflictDoNothing({ target: ingredients.name });
+        const [ing] = await db
+          .select({ id: ingredients.id })
+          .from(ingredients)
+          .where(eq(ingredients.name, ingName))
+          .limit(1);
+        if (!ing) continue;
+        await db
+          .insert(dishIngredients)
+          .values({ dishId: dishRow.id, ingredientId: ing.id })
+          .onConflictDoNothing();
+      }
+    }
+  }
+
+  await db.delete(dishPhotoLinks).where(eq(dishPhotoLinks.sourceMessageId, msg.id));
+  await upsertDishPhotoLinksFromCaption(msg);
 }
 
 export async function ingestMessage(
   _token: string,
   msg: GroupMeMessage,
-  existingOcr: string | null,
+  existing: ExistingMessageRow,
 ) {
-  const fresh = await runOcrIfNeeded(msg, existingOcr);
-  await upsertMessageRow(msg, existingOcr, fresh);
-  const finalOcr = fresh.ocrText ?? existingOcr ?? null;
-  await reparseDishesForMessage(msg, finalOcr);
+  const fresh = await runVisionIfNeeded(msg, existing);
+  await upsertMessageRow(msg, existing, fresh);
+  const finalVision = fresh.analysis ?? parseVisionJson(existing.visionJson);
+  const finalOcr = fresh.ocrText ?? existing.ocrText ?? null;
+  await reparseDishesForMessage(msg, finalVision, finalOcr);
 }
 
 export type SyncResult = {
@@ -237,11 +560,21 @@ export async function runIncrementalSync(
     if (messages.length === 0) break;
     for (const msg of messages) {
       const existing = await db
-        .select({ ocrText: messagesRaw.ocrText })
+        .select({
+          ocrText: messagesRaw.ocrText,
+          ocrProvider: messagesRaw.ocrProvider,
+          visionKind: messagesRaw.visionKind,
+          visionJson: messagesRaw.visionJson,
+        })
         .from(messagesRaw)
         .where(eq(messagesRaw.id, msg.id))
         .limit(1);
-      await ingestMessage(token, msg, existing[0]?.ocrText ?? null);
+      await ingestMessage(token, msg, {
+        ocrText: existing[0]?.ocrText ?? null,
+        ocrProvider: existing[0]?.ocrProvider ?? null,
+        visionKind: existing[0]?.visionKind ?? null,
+        visionJson: existing[0]?.visionJson ?? null,
+      });
       processed++;
       afterId = afterId ? maxMessageId(afterId, msg.id) : msg.id;
     }
@@ -304,11 +637,21 @@ export async function runBackfillSync(
     for (const msg of messages) {
       maxSeen = maxSeen ? maxMessageId(maxSeen, msg.id) : msg.id;
       const existing = await db
-        .select({ ocrText: messagesRaw.ocrText })
+        .select({
+          ocrText: messagesRaw.ocrText,
+          ocrProvider: messagesRaw.ocrProvider,
+          visionKind: messagesRaw.visionKind,
+          visionJson: messagesRaw.visionJson,
+        })
         .from(messagesRaw)
         .where(eq(messagesRaw.id, msg.id))
         .limit(1);
-      await ingestMessage(token, msg, existing[0]?.ocrText ?? null);
+      await ingestMessage(token, msg, {
+        ocrText: existing[0]?.ocrText ?? null,
+        ocrProvider: existing[0]?.ocrProvider ?? null,
+        visionKind: existing[0]?.visionKind ?? null,
+        visionJson: existing[0]?.visionJson ?? null,
+      });
       processed++;
       pageCursor = msg.id;
       if (cap !== undefined && processed >= cap) {
