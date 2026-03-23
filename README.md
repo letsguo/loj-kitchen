@@ -1,6 +1,6 @@
 # LOJ Kitchen
 
-Import a GroupMe group’s food content, analyze menu + meal images with **OpenAI vision**, parse menu lines into dishes and ingredients, and link meal photos back to likely menu items.
+Import a GroupMe group’s food content, analyze menu images with **OpenAI vision**, parse menu lines into dishes and ingredients, and link meal photos back to likely menu items using the accompanying message text.
 
 **Database:** **PostgreSQL** (e.g. [Neon](https://neon.tech/) or [Supabase](https://supabase.com/) free tier).  
 **Deploy:** [Vercel](https://vercel.com/) — see [Deploy on Vercel](#deploy-on-vercel).
@@ -42,7 +42,7 @@ Import a GroupMe group’s food content, analyze menu + meal images with **OpenA
 
 - **Image-only** dish extraction: text-only chat messages are not parsed into dishes.
 - Menu images are parsed into dish lines.
-- Meal images are matched to recent menu dish titles when confidence is high enough.
+- Meal photos are linked using their accompanying message text (caption/description), not by meal-image inference.
 
 ### Quick backfill cap
 

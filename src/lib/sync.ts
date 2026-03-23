@@ -20,7 +20,11 @@ import {
   splitIntoDishLines,
   tokenizeIngredientsFromLine,
 } from "@/lib/parser";
-import { analyzeMessageImages, isVisionConfigured, type VisionImageAnalysis, type VisionMessageAnalysis } from "@/lib/vision";
+import {
+  analyzeMessageImages,
+  isVisionConfigured,
+  type VisionMessageAnalysis,
+} from "@/lib/vision";
 
 const OCR_PROVIDER = "openai_responses_vision";
 
@@ -77,6 +81,23 @@ function collectMenuText(analysis: VisionMessageAnalysis): string | null {
   return chunks.join("\n\n").trim() || null;
 }
 
+function looksLikeMenuCaption(caption: string): boolean {
+  const text = caption.toLowerCase().trim();
+  if (!text) return false;
+  if (
+    /(menu|weekly|this week|cafeteria|lunch|dinner|breakfast|monday|tuesday|wednesday|thursday|friday|saturday|sunday)/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  return lines.length >= 4;
+}
+
 async function listRecentDishTitles(limit: number): Promise<string[]> {
   const db = getDb();
   const rows = await db
@@ -119,6 +140,17 @@ async function runVisionIfNeeded(
     };
   }
   if (!isVisionConfigured() || process.env.SKIP_VISION === "1") {
+    return {
+      analysis: null,
+      ocrText: null,
+      ocrProvider: null,
+      ocrAt: null,
+      visionKind: null,
+      visionJson: null,
+    };
+  }
+  // Meal images are matched via message text; only call OpenAI for likely menu posts.
+  if (!looksLikeMenuCaption(msg.text ?? "")) {
     return {
       analysis: null,
       ocrText: null,
@@ -266,29 +298,38 @@ async function loadCandidateDishes(limit = 220): Promise<CandidateDish[]> {
   }));
 }
 
-function chooseDishForMeal(
-  item: VisionImageAnalysis,
+function chooseDishForCaption(
   caption: string,
   candidates: CandidateDish[],
-): CandidateDish | null {
+): { dish: CandidateDish; confidence: number } | null {
+  const normalizedCaption = normalizeTitle(caption);
+  if (!normalizedCaption) return null;
+
   const byNorm = new Map<string, CandidateDish>();
   for (const c of candidates) {
     if (!byNorm.has(c.norm)) byNorm.set(c.norm, c);
   }
 
-  const menuMatch = normalizeTitle(item.matchedMenuTitle);
-  if (menuMatch) {
-    const exact = byNorm.get(menuMatch);
-    if (exact) return exact;
+  const exact = byNorm.get(normalizedCaption);
+  if (exact) {
+    return { dish: exact, confidence: 95 };
   }
 
-  const guessMatch = normalizeTitle(item.mealNameGuess);
-  if (guessMatch) {
-    const exact = byNorm.get(guessMatch);
-    if (exact) return exact;
+  let bestContains: CandidateDish | null = null;
+  for (const c of candidates) {
+    if (c.norm.length >= 6 && normalizedCaption.includes(c.norm)) {
+      if (!bestContains || c.norm.length > bestContains.norm.length) {
+        bestContains = c;
+      }
+    }
+  }
+  if (bestContains) {
+    return { dish: bestContains, confidence: 90 };
   }
 
-  const probe = tokenSet(`${item.mealNameGuess} ${caption}`);
+  const probe = tokenSet(caption);
+  if (probe.size === 0) return null;
+
   let best: CandidateDish | null = null;
   let bestScore = 0;
   for (const c of candidates) {
@@ -298,8 +339,10 @@ function chooseDishForMeal(
       best = c;
     }
   }
-  if (best && bestScore >= 0.72 && item.confidence >= 55) {
-    return best;
+  const threshold = probe.size <= 2 ? 0.8 : 0.6;
+  if (best && bestScore >= threshold) {
+    const confidence = Math.max(55, Math.min(89, Math.round(bestScore * 100)));
+    return { dish: best, confidence };
   }
   return null;
 }
@@ -327,29 +370,30 @@ function extractMenuLinesFromVision(
   return { lines, menuImageUrls: [...new Set(menuImageUrls)] };
 }
 
-async function upsertDishPhotoLinksForMessage(
-  msg: GroupMeMessage,
-  vision: VisionMessageAnalysis,
-) {
+async function upsertDishPhotoLinksFromCaption(msg: GroupMeMessage) {
   const db = getDb();
-  const meals = vision.items.filter((i) => i.kind === "meal");
-  if (meals.length === 0) return;
+  const imageUrls = messageImageUrls(msg);
+  if (imageUrls.length === 0) return;
+
+  const caption = (msg.text ?? "").trim();
+  if (!caption || looksLikeMenuCaption(caption)) return;
 
   const candidates = await loadCandidateDishes();
   if (candidates.length === 0) return;
 
-  for (const meal of meals) {
-    const selected = chooseDishForMeal(meal, msg.text ?? "", candidates);
-    if (!selected) continue;
+  const selected = chooseDishForCaption(caption, candidates);
+  if (!selected) return;
+
+  for (const imageUrl of imageUrls) {
     await db
       .insert(dishPhotoLinks)
       .values({
-        dishId: selected.id,
+        dishId: selected.dish.id,
         sourceMessageId: msg.id,
-        imageUrl: meal.imageUrl,
-        caption: msg.text ?? "",
-        matchedTitle: meal.matchedMenuTitle || meal.mealNameGuess || selected.title,
-        confidence: meal.confidence,
+        imageUrl,
+        caption,
+        matchedTitle: selected.dish.title,
+        confidence: selected.confidence,
         matchedAt: new Date(),
       })
       .onConflictDoUpdate({
@@ -359,9 +403,9 @@ async function upsertDishPhotoLinksForMessage(
           dishPhotoLinks.imageUrl,
         ],
         set: {
-          caption: msg.text ?? "",
-          matchedTitle: meal.matchedMenuTitle || meal.mealNameGuess || selected.title,
-          confidence: meal.confidence,
+          caption,
+          matchedTitle: selected.dish.title,
+          confidence: selected.confidence,
           matchedAt: new Date(),
         },
       });
@@ -383,7 +427,9 @@ async function reparseDishesForMessage(
   }
 
   if (!vision && !(fallbackOcrText ?? "").trim()) {
-    // No analysis available yet; keep any existing parse results intact.
+    // No menu analysis available yet; keep any existing parse results intact.
+    await db.delete(dishPhotoLinks).where(eq(dishPhotoLinks.sourceMessageId, msg.id));
+    await upsertDishPhotoLinksFromCaption(msg);
     return;
   }
 
@@ -458,10 +504,8 @@ async function reparseDishesForMessage(
     }
   }
 
-  if (vision) {
-    await db.delete(dishPhotoLinks).where(eq(dishPhotoLinks.sourceMessageId, msg.id));
-    await upsertDishPhotoLinksForMessage(msg, vision);
-  }
+  await db.delete(dishPhotoLinks).where(eq(dishPhotoLinks.sourceMessageId, msg.id));
+  await upsertDishPhotoLinksFromCaption(msg);
 }
 
 export async function ingestMessage(
