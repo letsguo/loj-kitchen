@@ -23,6 +23,7 @@ import {
 import {
   analyzeMessageImages,
   isVisionConfigured,
+  type VisionImageAnalysis,
   type VisionMessageAnalysis,
 } from "@/lib/vision";
 
